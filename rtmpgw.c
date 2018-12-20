@@ -960,6 +960,7 @@ ParseOption(char opt, char *arg, RTMP_REQUEST * req)
       break;
     case 'S':
       STR2AVAL(req->sockshost, arg);
+      break;
     case 'q':
       RTMP_debuglevel = RTMP_LOGCRIT;
       break;

@@ -111,6 +111,7 @@ typedef enum {
 static int DumpMetaData(AMFObject *obj);
 static int HandShake(RTMP *r, int FP9HandShake);
 static int SocksNegotiate(RTMP *r);
+static int HTTPNegotiate(RTMP *r);
 
 static int SendConnectPacket(RTMP *r, RTMPPacket *cp);
 static int SendCheckBW(RTMP *r);
@@ -150,6 +151,8 @@ static int clk_tck;
 
 #ifdef CRYPTO
 #include "handshake.h"
+
+static int b64enc(const unsigned char *input, int length, char *output, int maxsize);
 #endif
 
 uint32_t
@@ -409,25 +412,61 @@ const AVal RTMP_DefaultFlashVer =
 static void
 SocksSetup(RTMP *r, AVal *sockshost)
 {
+  const char* http_proxy = getenv("http_proxy");
+
   if (sockshost->av_len)
     {
       const char *socksport = strchr(sockshost->av_val, ':');
       char *hostname = strdup(sockshost->av_val);
 
       if (socksport)
-	hostname[socksport - sockshost->av_val] = '\0';
-      r->Link.sockshost.av_val = hostname;
-      r->Link.sockshost.av_len = strlen(hostname);
+        hostname[socksport - sockshost->av_val] = '\0';
+      r->Link.socksProxy.host.av_val = hostname;
+      r->Link.socksProxy.host.av_len = strlen(hostname);
 
-      r->Link.socksport = socksport ? atoi(socksport + 1) : 1080;
-      RTMP_Log(RTMP_LOGDEBUG, "Connecting via SOCKS proxy: %s:%d", r->Link.sockshost.av_val,
-	  r->Link.socksport);
+      r->Link.socksProxy.port = socksport ? atoi(socksport + 1) : 1080;
+      RTMP_Log(RTMP_LOGDEBUG, "Connecting via SOCKS proxy: %s:%d", r->Link.socksProxy.host.av_val,
+        r->Link.socksProxy.port);
     }
   else
     {
-      r->Link.sockshost.av_val = NULL;
-      r->Link.sockshost.av_len = 0;
-      r->Link.socksport = 0;
+      r->Link.socksProxy.host.av_val = NULL;
+      r->Link.socksProxy.host.av_len = 0;
+      r->Link.socksProxy.port = 0;
+    }
+
+  if (http_proxy)
+    {
+      /* skip protocol, e.g. http:// */
+      char* str = strstr(http_proxy, "://");
+      if (str) http_proxy = str + 3;
+
+      str = strchr(http_proxy, '@');
+      if (str)
+        {
+          char *userpass = strndup(http_proxy, str - http_proxy);
+          r->Link.httpProxy.userpass.av_val = userpass;
+          r->Link.httpProxy.userpass.av_len = strlen(userpass);
+          http_proxy = str + 1;
+        }
+
+      const char *httpport = strchr(http_proxy, ':');
+      char *hostname = strdup(http_proxy);
+
+      if (httpport)
+        hostname[httpport - http_proxy] = '\0';
+      r->Link.httpProxy.host.av_val = hostname;
+      r->Link.httpProxy.host.av_len = strlen(hostname);
+
+      r->Link.httpProxy.port = httpport ? atoi(httpport + 1) : 80;
+      RTMP_Log(RTMP_LOGDEBUG, "Connecting via HTTP proxy: %s:%d", r->Link.httpProxy.host.av_val,
+         r->Link.httpProxy.port);
+    }
+  else
+    {
+      r->Link.httpProxy.host.av_val = NULL;
+      r->Link.httpProxy.host.av_len = 0;
+      r->Link.httpProxy.port = 0;
     }
 }
 
@@ -525,18 +564,18 @@ RTMP_SetupStream(RTMP *r,
   r->Link.timeout = timeout;
 
   r->Link.protocol = protocol;
-  r->Link.hostname = *host;
-  r->Link.port = port;
+  r->Link.server.host = *host;
+  r->Link.server.port = port;
   r->Link.playpath = *playpath;
 
-  if (r->Link.port == 0)
+  if (r->Link.server.port == 0)
     {
       if (protocol & RTMP_FEATURE_SSL)
-	r->Link.port = 443;
+	r->Link.server.port = 443;
       else if (protocol & RTMP_FEATURE_HTTP)
-	r->Link.port = 80;
+	r->Link.server.port = 80;
       else
-	r->Link.port = 1935;
+	r->Link.server.port = 1935;
     }
 }
 
@@ -553,7 +592,7 @@ static struct urlopt {
   int omisc;
   char *use;
 } options[] = {
-  { AVC("socks"),     OFF(Link.sockshost),     OPT_STR, 0,
+  { AVC("socks"),     OFF(Link.socksProxy.host),     OPT_STR, 0,
   	"Use the specified SOCKS proxy" },
   { AVC("app"),       OFF(Link.app),           OPT_STR, 0,
 	"Name of target app on server" },
@@ -765,11 +804,11 @@ int RTMP_SetupURL(RTMP *r, char *url)
     *ptr = '\0';
 
   len = strlen(url);
-  ret = RTMP_ParseURL(url, &r->Link.protocol, &r->Link.hostname,
-  	&port, &r->Link.playpath0, &r->Link.app);
+  ret = RTMP_ParseURL(url, &r->Link.protocol, &r->Link.server.host,
+	&port, &r->Link.playpath0, &r->Link.app);
   if (!ret)
     return ret;
-  r->Link.port = port;
+  r->Link.server.port = port;
   r->Link.playpath = r->Link.playpath0;
 
   while (ptr) {
@@ -828,14 +867,14 @@ int RTMP_SetupURL(RTMP *r, char *url)
     	    }
     	  else
     	    {
-    	      len = r->Link.hostname.av_len + r->Link.app.av_len +
+              len = r->Link.server.host.av_len + r->Link.app.av_len +
     		  sizeof("rtmpte://:65535/");
 	      r->Link.tcUrl.av_val = malloc(len);
 	      r->Link.tcUrl.av_len = snprintf(r->Link.tcUrl.av_val, len,
 		"%s://%.*s:%d/%.*s",
 		RTMPProtocolStringsLower[r->Link.protocol],
-		r->Link.hostname.av_len, r->Link.hostname.av_val,
-		r->Link.port,
+		r->Link.server.host.av_len, r->Link.server.host.av_val,
+		r->Link.server.port,
 		r->Link.app.av_len, r->Link.app.av_val);
 	      r->Link.lFlags |= RTMP_LF_FTCU;
 	    }
@@ -852,17 +891,18 @@ int RTMP_SetupURL(RTMP *r, char *url)
 	  (unsigned char *)r->Link.SWFHash, r->Link.swfAge);
 #endif
 
-  SocksSetup(r, &r->Link.sockshost);
+  SocksSetup(r, &r->Link.socksProxy.host);
 
-  if (r->Link.port == 0)
+  if (r->Link.server.port == 0)
     {
       if (r->Link.protocol & RTMP_FEATURE_SSL)
-	r->Link.port = 443;
+	r->Link.server.port = 443;
       else if (r->Link.protocol & RTMP_FEATURE_HTTP)
-	r->Link.port = 80;
+	r->Link.server.port = 80;
       else
-	r->Link.port = 1935;
+	r->Link.server.port = 1935;
     }
+
   return TRUE;
 }
 
@@ -922,7 +962,7 @@ RTMP_Connect0(RTMP *r, struct sockaddr * service)
 	  return FALSE;
 	}
 
-      if (r->Link.socksport)
+      if (r->Link.socksProxy.port)
 	{
 	  RTMP_Log(RTMP_LOGDEBUG, "%s ... SOCKS negotiation", __FUNCTION__);
 	  if (!SocksNegotiate(r))
@@ -932,6 +972,17 @@ RTMP_Connect0(RTMP *r, struct sockaddr * service)
 	      return FALSE;
 	    }
 	}
+
+      if (r->Link.httpProxy.port)
+        {
+          RTMP_Log(RTMP_LOGDEBUG, "%s ... HTTP proxy negotiation", __FUNCTION__);
+          if (!HTTPNegotiate(r))
+            {
+              RTMP_Log(RTMP_LOGERROR, "%s, HTTP proxy negotiation failed.", __FUNCTION__);
+              RTMP_Close(r);
+              return FALSE;
+            }
+        }
     }
   else
     {
@@ -1031,24 +1082,26 @@ int
 RTMP_Connect(RTMP *r, RTMPPacket *cp)
 {
   struct sockaddr_in service;
-  if (!r->Link.hostname.av_len)
+  RTMPSockInfo* sock;
+
+  if (!r->Link.server.host.av_len)
     return FALSE;
 
   memset(&service, 0, sizeof(struct sockaddr_in));
   service.sin_family = AF_INET;
 
-  if (r->Link.socksport)
-    {
+  if (r->Link.socksProxy.port)
       /* Connect via SOCKS */
-      if (!add_addr_info(&service, &r->Link.sockshost, r->Link.socksport))
-	return FALSE;
-    }
+      sock = &r->Link.socksProxy;
+  else if (r->Link.httpProxy.port)
+      /* Connect via HTTP proxy */
+      sock = &r->Link.httpProxy;
   else
-    {
       /* Connect directly */
-      if (!add_addr_info(&service, &r->Link.hostname, r->Link.port))
+      sock = &r->Link.server;
+
+  if (!add_addr_info(&service, &sock->host, sock->port))
 	return FALSE;
-    }
 
   if (!RTMP_Connect0(r, (struct sockaddr *)&service))
     return FALSE;
@@ -1065,14 +1118,14 @@ SocksNegotiate(RTMP *r)
   struct sockaddr_in service;
   memset(&service, 0, sizeof(struct sockaddr_in));
 
-  add_addr_info(&service, &r->Link.hostname, r->Link.port);
+  add_addr_info(&service, &r->Link.server.host, r->Link.server.port);
   addr = htonl(service.sin_addr.s_addr);
 
   {
     char packet[] = {
       4, 1,			/* SOCKS 4, connect */
-      (r->Link.port >> 8) & 0xFF,
-      (r->Link.port) & 0xFF,
+      (r->Link.server.port >> 8) & 0xFF,
+      (r->Link.server.port) & 0xFF,
       (char)(addr >> 24) & 0xFF, (char)(addr >> 16) & 0xFF,
       (char)(addr >> 8) & 0xFF, (char)addr & 0xFF,
       0
@@ -1093,6 +1146,52 @@ SocksNegotiate(RTMP *r)
         return FALSE;
       }
   }
+}
+
+static int
+HTTPNegotiate(RTMP *r)
+{
+  char hbuf[512];
+  char userpass[100];
+  char auth[200];
+  int ret;
+  RTMPSockBuf buf;
+
+  if (r->Link.httpProxy.userpass.av_len)
+    {
+      b64enc(r->Link.httpProxy.userpass.av_val, r->Link.httpProxy.userpass.av_len, userpass, sizeof(userpass));
+      snprintf(auth, sizeof(auth), "Proxy-Authorization: Basic %s\r\n", userpass);
+    }
+
+  int hlen = snprintf(hbuf, sizeof(hbuf), "CONNECT %s:%d HTTP/1.1\r\n"
+    "%s\r\n", r->Link.server.host.av_val, r->Link.server.port, auth);
+
+  RTMPSockBuf_Send(&r->m_sb, hbuf, hlen);
+
+  // hack to not mess with the other buffer
+  memset(&buf, 0, sizeof(RTMPSockBuf));
+  buf.sb_socket = r->m_sb.sb_socket;
+  RTMPSockBuf_Fill(&buf);
+
+#define ESTABLISHED_MESSAGE "HTTP/1.1 200 Connection established"
+
+  if (buf.sb_size < strlen(ESTABLISHED_MESSAGE))
+    {
+      RTMP_Log(RTMP_LOGERROR, "%s, HTTP proxy didn't return enough bytes: %d", __FUNCTION__, buf.sb_size);
+      RTMP_Log(RTMP_LOGDEBUG2, "%s, HTTP proxy returned:\n%s", __FUNCTION__, buf.sb_start);
+      return FALSE;
+    }
+
+  if (strncmp(buf.sb_start, ESTABLISHED_MESSAGE, strlen(ESTABLISHED_MESSAGE)))
+    {
+      RTMP_Log(RTMP_LOGERROR, "%s, HTTP proxy didn't return connection established", __FUNCTION__);
+      RTMP_Log(RTMP_LOGDEBUG2, "%s, HTTP proxy returned:\n%s", __FUNCTION__, buf.sb_start);
+      return FALSE;
+    }
+
+#undef ESTABLISHED_MESSAGE
+
+  return TRUE;
 }
 
 int
@@ -4416,8 +4515,8 @@ HTTP_Post(RTMP *r, RTMPTCmd cmd, const char *buf, int len)
     "Content-type: application/x-fcs\r\n"
     "Content-length: %d\r\n\r\n", RTMPT_cmds[cmd],
     r->m_clientID.av_val ? r->m_clientID.av_val : "",
-    r->m_msgCounter, r->Link.hostname.av_len, r->Link.hostname.av_val,
-    r->Link.port, len);
+    r->m_msgCounter, r->Link.server.host.av_len, r->Link.server.host.av_val,
+    r->Link.server.port, len);
   RTMPSockBuf_Send(&r->m_sb, hbuf, hlen);
   hlen = RTMPSockBuf_Send(&r->m_sb, buf, len);
   r->m_msgCounter++;

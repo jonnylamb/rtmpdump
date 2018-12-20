@@ -249,18 +249,18 @@ ServeInvoke(STREAMING_SERVER *server, int which, RTMPPacket *pack, const char *b
                   r2 = malloc(len+1);
                   memcpy(r2, r1, len);
                   r2[len] = '\0';
-                  server->rc.Link.hostname.av_val = r2;
+                  server->rc.Link.server.host.av_val = r2;
                   r1 = strrchr(r2, ':');
                   if (r1)
                     {
-		      server->rc.Link.hostname.av_len = r1 - r2;
+		      server->rc.Link.server.host.av_len = r1 - r2;
                       *r1++ = '\0';
-                      server->rc.Link.port = atoi(r1);
+                      server->rc.Link.server.port = atoi(r1);
                     }
                   else
                     {
-		      server->rc.Link.hostname.av_len = len;
-                      server->rc.Link.port = 1935;
+		      server->rc.Link.server.host.av_len = len;
+                      server->rc.Link.server.port = 1935;
                     }
                 }
               pval.av_val = NULL;
@@ -993,7 +993,7 @@ cleanup:
   server->f_cur = NULL;
   free(buf);
   /* Should probably be done by RTMP_Close() ... */
-  server->rc.Link.hostname.av_val = NULL;
+  server->rc.Link.server.host.av_val = NULL;
   server->rc.Link.tcUrl.av_val = NULL;
   server->rc.Link.swfUrl.av_val = NULL;
   server->rc.Link.pageUrl.av_val = NULL;
